@@ -11,22 +11,22 @@ flowchart TD
     end
 
     subgraph ProxyLayer ["Node.js SMTP 代理核心服务"]
-        SMTP[SMTP 服务模块\n(smtp-server 仅监听加密端口 465/587；465 为隐式 TLS，587 为 STARTTLS)]
-        Auth[认证 & 黑名单拦截\n(内存缓存快速匹配)]
-        ContentStore[邮件原文文件存储\n(FS: /data/raw_mails)]
+        SMTP["SMTP 服务模块<br/>(smtp-server 仅监听加密端口 465/587；465 为隐式 TLS，587 为 STARTTLS)"]
+        Auth["认证 & 黑名单拦截<br/>(内存缓存快速匹配)"]
+        ContentStore["邮件原文文件存储<br/>(FS: /data/raw_mails)"]
         
         subgraph DataQueue ["串行写入中枢 (Single Writer)"]
-            WriteQueue[串行操作队列\n(p-queue / async channel)]
-            DB[(SQLite 数据库\nWAL 模式)]
+            WriteQueue["串行操作队列<br/>(p-queue / async channel)"]
+            DB[("SQLite 数据库<br/>WAL 模式")]
         end
 
-        SESWorker[SES 投递调度器\n(指数退避 / 限流)]
-        Webhook[SNS Webhook 接收器\n(HTTP 监听 / SNS 验签)]
+        SESWorker["SES 投递调度器<br/>(指数退避 / 限流)"]
+        Webhook["SNS Webhook 接收器<br/>(HTTP 监听 / SNS 验签)"]
     end
 
     subgraph AWSLayer ["AWS 云服务"]
-        SES[AWS SES\n(SendRawEmail)]
-        SNS[AWS SNS\n(Bounce/Complaint/Delivery)]
+        SES["AWS SES<br/>(SendRawEmail)"]
+        SNS["AWS SNS<br/>(Bounce/Complaint/Delivery)"]
     end
 
     %% 发送流程
