@@ -61,10 +61,11 @@ flowchart TD
 | 环节 | 初始设想 | 潜在风险/缺失环节 | 闭环架构优化方案 |
 | :--- | :--- | :--- | :--- |
 | **收件人黑名单过滤时机** | 仅入库记录 | 若收到发给黑名单的邮件仍调用 SES，会招致 AWS 处罚（SES 极度惩罚 Hard Bounce 率 > 5% 的账号） | **在 SMTP `rcptTo` 阶段直接拒绝（550 Recipient rejected）**，不落盘也不打 SES，直接省钱且保护账号信用额度。 |
-| **SES 消息 ID 关联** | 记录邮件内容与发送结果 | 客户端自带的 `Message-ID` 头与 SES 返回的 `sesMessageId` **不一致**。SNS 回调只会携带 `sesMessageId` | SES 接口响应后，**必须将 SES 返回的唯一 ID 记录到本地库**，建立主键/索引，供 SNS 回调更新状态。 |
+| **收件人域名过滤** | 只按完整邮箱地址过滤 | 乱写的域名、没有有效邮件路由的域名会制造硬退信；仅依赖 SES 反馈会有延迟和成本 | 在 `rcptTo` 阶段先执行域名白名单/黑名单，再做 DNS MX 检查；白名单域名（如 `gmail.com`）直接放行，明确无 MX 的域名拒绝并进入域名阻断记录。DNS 失败时采用“暂时拒绝重试”，不要误加入永久黑名单。 |
+| **SES 消息 ID 关联** | 记录邮件内容与发送结果 | 客户端自带的 `Message-ID` 头与 SES 返回的 `sesMessageId` **不一致**。SNS 回调只会携带 `sesMessageId` | SES 成功返回后，**必须将 AWS `MessageId` 作为同一写队列事务的一部分立即回填**，并在 `ses_message_id` 上建立唯一索引；SNS 只允许按该字段关联，查不到则记录孤儿事件，不得更新任意邮件。 |
 | **SQLite 性能与大体积阻塞** | 全部读写串行 | 邮件 MIME 原文（含附件）动辄数 MB，若直接将 BLOB 串行塞入 SQLite，单次写入会导致后续所有认证/查询排队，甚至引起 SMTP 握手超时 | **动静分离**：MIME 邮件内容写独立本地文件（如 `/data/raw/<id>.eml`），SQLite 只存结构化元数据（发件人、收件人、主题、文件路径、哈希、状态）。 |
 | **并发读与串行写** | 读写全串行 | 若客户端一次性建立 20 个并发 SMTP 连接发信，每个连接都要查库验证账密，全串行读写会导致严重延迟 | **开启 SQLite WAL 模式**（Write-Ahead Logging）：**并发只读 + 独占单线程写队列**；敏感热点（黑名单、鉴权用户）常驻内存 Set/Map。 |
-| **SNS 订阅握手与真实性** | 接收 Webhook 结果 | SNS 首次配置必须处理 `SubscriptionConfirmation`（自动访问 `SubscribeURL`）；且任何外网能访问的 HTTP 端口可能被伪造回调 | 必须引入 **SNS 消息签名校验**，并自动应答 SNS 的订阅握手请求。 |
+| **SNS 订阅握手与真实性** | 接收 Webhook 结果 | SNS 首次配置必须处理 `SubscriptionConfirmation`（自动访问 `SubscribeURL`）；且任何外网能访问的 HTTP 端口可能被伪造回调 | 必须使用 `@aws-sdk/sns-validator` 验证原始请求中的 `SigningCertURL`、签名版本、证书域名和 `Signature`；验签失败立即返回 403，绝不解析、入库或更新黑名单。 |
 
 ---
 
@@ -88,6 +89,19 @@ flowchart TD
 - **写操作（串行队列）**：
   - 采用单一工作线程/单消费队列（如 `p-queue` 并发度设为 `1`）。
   - 所有需要写入的操作（邮件生成排队、SES 返回 MessageId 记录、SNS 状态回填、黑名单追加）统一推入队列，按序单连接写入。
+  - SES 发送成功后的回填必须使用 `UPDATE email_audits SET ses_message_id = ?, status = 'SES_ACCEPTED' WHERE id = ? AND ses_message_id IS NULL`，检查受影响行数；若为 0，记录异常并禁止重复或错误关联。
+
+### 3. 收件人域名白名单、黑名单与 MX 策略
+- 在 SMTP `RCPT TO` 阶段规范化邮箱：域名转小写、去除尾部句点，拒绝非法域名格式。
+- 维护两级策略：
+  1. **域名白名单**：例如 `gmail.com`，命中后允许投递，但仍可记录 DNS 检查结果；白名单只表示允许策略，不代表一定能投递。
+  2. **域名黑名单**：明确禁止的域名直接返回 `550 5.1.2 Recipient domain rejected`，并写入审计日志，不调用 SES。
+- 对未命中白名单/黑名单的域名执行 DNS MX 查询：
+  - 存在 MX 记录：继续接收，并缓存正结果（例如 5 分钟）。
+  - 明确不存在 MX 记录（NXDOMAIN 或空答案）：拒绝本次收件人，并写入 `domain_blocklist`，避免后续再次调用 SES。
+  - DNS 超时、SERVFAIL 或本地解析器暂时不可用：返回 `451 4.4.3 Temporary DNS failure`，**不得**写入永久黑名单，允许客户端稍后重试。
+- 这是运营策略而非绝对 DNS 规则：RFC 邮件投递在没有 MX 时可以回退到 A/AAAA 记录。若业务必须严格要求 MX，按上述策略执行；若需要兼容此类合法域名，应将“A/AAAA 回退”做成可配置项。
+- 域名阻断应支持 TTL、原因、最后 DNS 检查时间和人工解除，避免一次 DNS 故障导致永久误杀。
 
 ---
 
@@ -170,12 +184,24 @@ CREATE TABLE IF NOT EXISTS email_blacklist (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+  -- 3a. 收件人域名策略（白名单优先于黑名单）
+  CREATE TABLE IF NOT EXISTS domain_policies (
+    domain TEXT PRIMARY KEY,                    -- 小写规范化域名，如 gmail.com
+    policy TEXT NOT NULL CHECK (policy IN ('ALLOW', 'DENY')),
+    reason TEXT NOT NULL,                       -- MANUAL / NO_MX / POLICY
+    expires_at DATETIME,                        -- NULL 表示不过期
+    last_dns_checked_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  );
+
 -- 4. 投递事件追踪表 (一次发送可能有多次事件)
 CREATE TABLE IF NOT EXISTS delivery_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     audit_id TEXT NOT NULL,                    -- 关联 email_audits.id
     ses_message_id TEXT,
     event_type TEXT NOT NULL,                  -- Send, Delivery, Bounce, Complaint
+  event_hash TEXT UNIQUE NOT NULL,            -- SNS 原始事件幂等键/哈希
     event_payload TEXT NOT NULL,               -- SNS 返回的原始 JSON (完备审计)
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY(audit_id) REFERENCES email_audits(id)
@@ -190,8 +216,9 @@ CREATE TABLE IF NOT EXISTS delivery_events (
 - 客户端发送 `AUTH LOGIN / PLAIN`：SMTP 模块拦截校验用户名密码。
 - 客户端发送 `RCPT TO:<user@example.com>`：
   - 提取目标邮箱，做小写化归一。
-  - 先查内存中的 `BlacklistSet`（O(1) 速度）。
-  - 若命中黑名单，直接向客户端返回：
+  - 先查内存中的邮箱 `BlacklistSet`；再查域名策略缓存：域名黑名单直接拒绝，域名白名单允许继续检查。
+  - 对未命中明确策略的域名执行 MX 查询，并缓存结果；明确无 MX 时写入临时/可过期的域名阻断记录并拒绝，DNS 临时故障返回 4xx。
+  - 若命中邮箱黑名单或域名黑名单，直接向客户端返回：
     `550 5.1.1 Recipient address rejected: Address is in suppression list`。
   - **收益**：避免后续所有解析、落盘、AWS 调用，零成本拦截无效发信。
 
@@ -204,22 +231,26 @@ CREATE TABLE IF NOT EXISTS delivery_events (
 ### 3. SES 出站投递与重试
 - 异步工作流读取 `PENDING` 邮件，调用 `@aws-sdk/client-ses` 的 `SendRawEmailCommand`。
 - 获取到 AWS 返回的 `MessageId` 后，向串行队列提交更新任务：
-  - 更新 `email_audits.ses_message_id = :sesId, status = 'SES_ACCEPTED'`。
+  - 将本地 `audit_id` 与 AWS 返回的 `MessageId` 一并提交给唯一写队列。
+  - 在同一事务中执行带 `WHERE id = :auditId AND ses_message_id IS NULL` 的更新，并确认恰好更新一行；成功后才允许该邮件进入 `SES_ACCEPTED`。
+  - SNS 只能通过 `mail.messageId = email_audits.ses_message_id` 关联邮件，不能使用客户端 `Message-ID`，也不能按发件人、收件人等非唯一字段猜测关联。
 - **如果遇到限流（Throttling 400）**：
   - 采用指数退避重试（Exponential Backoff），保护 SES 发送速率在许可的 Rate Limit（如 14 封/秒或更高速率）内。
 
 ### 4. SNS 反馈与黑名单自动填充
 - Fastify 暴露 `/webhook/aws-sns`。
-- 接收到请求后，使用 `@aws-sdk/sns-validator` 校验有效性。
-- 如果是 `SubscriptionConfirmation`：自动向 `SubscribeURL` 发起 GET 请求完成绑定。
+- 必须读取并保留未修改的原始 HTTP 请求体；先使用 `@aws-sdk/sns-validator` 校验有效性，再执行任何 JSON 业务处理。验证内容至少包括 `Type`、`SigningCertURL`、`SignatureVersion`、`Signature` 以及 AWS SNS 规范要求的字段顺序。
+- 验签器必须拒绝非 `https` 的证书地址、非 AWS SNS 域名/区域的证书地址、证书链校验失败、签名版本不支持和签名不匹配的请求；失败返回 HTTP 403，不写数据库、不更新状态、不加入黑名单。
+- 如果是 `SubscriptionConfirmation`：验签通过后，校验 `SubscribeURL` 为 HTTPS 的 AWS SNS 地址，再自动向其发起 GET 请求完成绑定；不能接受客户端传入的任意 URL。
 - 如果是 `Notification`：
   - 解析出 `eventType`（`Bounce` / `Complaint` / `Delivery`）。
   - 提取其 `mail.messageId`。
   - 封装串行写入任务：
-    1. 根据 `ses_message_id` 找到对应的 `email_audits` 记录。
-    2. 插入一条原始记录至 `delivery_events`。
-    3. 更新主表状态为 `DELIVERED` / `BOUNCED` / `COMPLAINED`。
-    4. **若是 Hard Bounce（如 `bounceType === "Permanent"`）或投诉**：
+    1. 根据唯一索引 `ses_message_id = mail.messageId` 找到对应的 `email_audits` 记录；找不到时只记录安全告警和原始事件，绝不猜测 `audit_id`。
+    2. 使用事件唯一键或事件哈希实现幂等，重复 SNS 通知不能重复污染状态或黑名单。
+    3. 插入一条原始记录至 `delivery_events`。
+    4. 更新主表状态为 `DELIVERED` / `BOUNCED` / `COMPLAINED`，并校验状态迁移合法性。
+    5. **若是 Hard Bounce（如 `bounceType === "Permanent"`）或投诉**：
        - 向 `email_blacklist` 插入该收件人邮箱。
        - 同步向内存的 `BlacklistSet` 添加该邮箱（热更新缓存）。
 
