@@ -35,7 +35,7 @@ flowchart TD
     SMTP -->|3. 写入邮件原文到磁盘| ContentStore
     SMTP -->|4. 提交审计元数据| WriteQueue
     WriteQueue -->|5. 串行入库| DB
-    SMTP -.->|6. 响应 250 OK (排队成功)| Client
+    SMTP -.->|6. 响应 250 OK：排队成功| Client
     
     %% 投递流程
     ContentStore -->|7. 读取 MIME 原文| SESWorker
