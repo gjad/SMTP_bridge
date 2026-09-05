@@ -11,7 +11,7 @@ flowchart TD
     end
 
     subgraph ProxyLayer ["Node.js SMTP 代理核心服务"]
-        SMTP[SMTP 服务模块\n(smtp-server 监听 25/465/587)]
+        SMTP[SMTP 服务模块\n(smtp-server 仅监听加密端口 465/587；465 为隐式 TLS，587 为 STARTTLS)]
         Auth[认证 & 黑名单拦截\n(内存缓存快速匹配)]
         ContentStore[邮件原文文件存储\n(FS: /data/raw_mails)]
         
